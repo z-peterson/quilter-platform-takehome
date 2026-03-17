@@ -37,10 +37,7 @@ A containerized Python API deployed to local Kubernetes with Terraform, wrapped 
 # Deploy everything (build, load image, terraform apply)
 VERSION=1.0.0 ./dev up
 
-# Port-forward the service to localhost:8080
-./dev url &
-
-# Run smoke tests
+# Smoke test (starts port-forward automatically)
 ./dev test
 
 # Rolling update to a new version
@@ -61,10 +58,10 @@ VERSION=2.0.0 ./dev up
 | `./dev status` | Show nodes, pods, services, deployed version |
 | `./dev logs` | Tail pod logs |
 | `./dev url` | Port-forward service to `localhost:8080` |
-| `./dev test` | Smoke test `/healthz` and `/version` via curl |
+| `./dev test` | Smoke test `/healthz` and `/version` (manages port-forward automatically) |
 | `./dev preflight` | Verify docker, terraform, kubectl are installed |
 
-Set the version with the `VERSION` environment variable (default: `latest`).
+Set the version with the `VERSION` environment variable (default: `latest`). Use `LOCAL_PORT` to change the port-forward port (default: `8080`).
 
 ## Design Decisions
 
@@ -119,3 +116,20 @@ docker build -t quilter-api:$VERSION .
 ```
 
 Everything else (Terraform, port-forward, smoke tests) works the same.
+
+For multi-node k3s clusters, set `WORKER_SSH_USER` to distribute images to all nodes:
+
+```bash
+WORKER_SSH_USER=core VERSION=1.0.0 ./dev up
+```
+
+## Production Considerations
+
+This project is scoped for local development. In a production setting, I'd add:
+
+- **Remote state** — Terraform state in S3/GCS with locking (DynamoDB/GCS), not local
+- **Container registry** — Push images to ECR/GCR/GHCR instead of loading directly into containerd
+- **CI/CD** — GitHub Actions pipeline: lint, test, build, push image, deploy
+- **Ingress** — Replace port-forward with an ingress controller and proper DNS
+- **Secrets management** — External secrets operator or Vault, not env vars for sensitive config
+- **Observability** — Structured logging, Prometheus metrics, health check dashboards

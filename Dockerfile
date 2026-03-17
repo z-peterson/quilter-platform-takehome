@@ -9,7 +9,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/main.py .
 
-RUN adduser --disabled-password --no-create-home appuser
+RUN adduser --disabled-password --gecos "" --no-create-home appuser
 USER appuser
 
 EXPOSE 8080

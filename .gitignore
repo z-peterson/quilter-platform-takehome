@@ -3,7 +3,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 terraform/.terraform/
-terraform/.terraform.lock.hcl
 terraform/terraform.tfstate
 terraform/terraform.tfstate.backup
 .DS_Store

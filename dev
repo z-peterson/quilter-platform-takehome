@@ -4,10 +4,11 @@ set -euo pipefail
 VERSION="${VERSION:-latest}"
 IMAGE="quilter-api"
 NAMESPACE="quilter-demo"
+LOCAL_PORT="${LOCAL_PORT:-8080}"
 TF_DIR="$(cd "$(dirname "$0")/terraform" && pwd)"
 KUBECONFIG_PATH="${KUBECONFIG:-$HOME/.kube/config}"
 export KUBECONFIG="$KUBECONFIG_PATH"
-WORKER_SSH_USER="${WORKER_SSH_USER:-core}"
+WORKER_SSH_USER="${WORKER_SSH_USER:-}"
 
 # Colors
 RED='\033[0;31m'
@@ -65,40 +66,35 @@ cmd_build() {
     docker build -t "${IMAGE}:${VERSION}" "$(dirname "$0")"
     ok "Image built: ${IMAGE}:${VERSION}"
 
-    info "Saving image to tarball..."
+    info "Loading image into k3s containerd..."
     local tarball="/tmp/${IMAGE}-${VERSION}.tar"
     docker save "${IMAGE}:${VERSION}" -o "$tarball"
-
-    info "Loading image into k3s containerd (all nodes)..."
-    # Load on control plane
     sudo k3s ctr images import "$tarball"
-    ok "Image loaded on control plane"
+    ok "Image loaded on local node"
 
-    # Load on worker nodes (skip if single-node cluster)
-    local workers
-    workers=$(kubectl get nodes -o json 2>/dev/null | python3 -c "
+    # Multi-node: distribute to workers via SSH (set WORKER_SSH_USER to enable)
+    if [[ -n "$WORKER_SSH_USER" ]]; then
+        local workers
+        workers=$(kubectl get nodes -o json 2>/dev/null | python3 -c "
 import json, sys
-data = json.load(sys.stdin)
-for node in data['items']:
-    labels = node['metadata'].get('labels', {})
-    if 'node-role.kubernetes.io/control-plane' not in labels:
+for node in json.load(sys.stdin)['items']:
+    if 'node-role.kubernetes.io/control-plane' not in node['metadata'].get('labels', {}):
         for addr in node['status']['addresses']:
-            if addr['type'] == 'InternalIP':
-                print(addr['address'])
+            if addr['type'] == 'InternalIP': print(addr['address'])
 " 2>/dev/null || true)
 
-    for ip in $workers; do
-        if [[ -n "$ip" ]]; then
+        for ip in $workers; do
             info "Loading image on worker $ip..."
             scp -q -o StrictHostKeyChecking=no "$tarball" "${WORKER_SSH_USER}@${ip}:/tmp/" \
-                && ssh -o StrictHostKeyChecking=no "${WORKER_SSH_USER}@${ip}" "sudo k3s ctr images import /tmp/$(basename "$tarball") && rm /tmp/$(basename "$tarball")" \
+                && ssh -o StrictHostKeyChecking=no "${WORKER_SSH_USER}@${ip}" \
+                    "sudo k3s ctr images import /tmp/$(basename "$tarball") && rm /tmp/$(basename "$tarball")" \
                 && ok "Image loaded on $ip" \
-                || warn "Failed to load image on $ip (may not be reachable)"
-        fi
-    done
+                || warn "Failed to load on $ip (may not be reachable)"
+        done
+    fi
 
     rm -f "$tarball"
-    ok "Image distributed to cluster"
+    ok "Image ready"
 }
 
 cmd_deploy() {
@@ -159,22 +155,45 @@ cmd_logs() {
 
 cmd_url() {
     ensure_kubeconfig
-    info "Forwarding quilter-api service to localhost:8080..."
+    info "Forwarding quilter-api service to localhost:${LOCAL_PORT}..."
     info "Endpoints:"
-    ok "  Health: http://localhost:8080/healthz"
-    ok "  Version: http://localhost:8080/version"
+    ok "  Health: http://localhost:${LOCAL_PORT}/healthz"
+    ok "  Version: http://localhost:${LOCAL_PORT}/version"
     echo
     info "Press Ctrl+C to stop"
-    kubectl -n "$NAMESPACE" port-forward svc/quilter-api 8080:80
+    kubectl -n "$NAMESPACE" port-forward svc/quilter-api "${LOCAL_PORT}:80"
 }
 
 cmd_test() {
+    ensure_kubeconfig
+
+    # Start port-forward if not already running
+    local pf_pid=""
+    if ! curl -sf http://localhost:${LOCAL_PORT}/healthz &>/dev/null; then
+        info "Starting port-forward..."
+        kubectl -n "$NAMESPACE" port-forward svc/quilter-api "${LOCAL_PORT}:80" &>/dev/null &
+        pf_pid=$!
+        # Wait for port-forward to be ready
+        local retries=0
+        while ! curl -sf http://localhost:${LOCAL_PORT}/healthz &>/dev/null; do
+            retries=$((retries + 1))
+            if [[ $retries -ge 10 ]]; then
+                kill "$pf_pid" 2>/dev/null || true
+                err "Port-forward failed to start"
+                return 1
+            fi
+            sleep 1
+        done
+    fi
+
+    trap '[[ -n "${pf_pid:-}" ]] && kill "$pf_pid" 2>/dev/null || true' RETURN
+
     info "Running smoke tests..."
     local failed=0
 
     info "Testing /healthz"
     local health
-    health=$(curl -sf http://localhost:8080/healthz 2>/dev/null) || { err "/healthz failed"; failed=1; }
+    health=$(curl -sf http://localhost:${LOCAL_PORT}/healthz) || { err "/healthz failed"; failed=1; }
     if [[ $failed -eq 0 ]]; then
         echo "  $health"
         ok "/healthz passed"
@@ -182,14 +201,13 @@ cmd_test() {
 
     info "Testing /version"
     local ver
-    ver=$(curl -sf http://localhost:8080/version 2>/dev/null) || { err "/version failed"; failed=1; }
+    ver=$(curl -sf http://localhost:${LOCAL_PORT}/version) || { err "/version failed"; failed=1; }
     if [[ $failed -eq 0 ]]; then
         echo "  $ver"
         ok "/version passed"
     fi
 
     if [[ $failed -eq 1 ]]; then
-        err "Smoke tests failed. Is port-forward running? (./dev url)"
         return 1
     fi
     ok "All smoke tests passed"
@@ -207,16 +225,17 @@ Commands:
   status      Show cluster and deployment status
   logs        Tail pod logs
   url         Port-forward service to localhost:8080
-  test        Smoke test endpoints via curl
+  test        Smoke test endpoints (manages port-forward automatically)
   preflight   Check prerequisites
 
 Environment:
-  VERSION     App version to deploy (default: latest)
+  VERSION          App version to deploy (default: latest)
+  LOCAL_PORT       Port for port-forward and smoke tests (default: 8080)
+  WORKER_SSH_USER  SSH user for multi-node image distribution (optional)
 
 Examples:
   VERSION=1.0.0 ./dev up      # Build and deploy v1.0.0
-  ./dev url &                  # Port-forward in background
-  ./dev test                   # Run smoke tests
+  ./dev test                   # Smoke test endpoints
   VERSION=2.0.0 ./dev up      # Rolling update to v2.0.0
   ./dev down                   # Clean teardown
 EOF
