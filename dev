@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="${VERSION:-latest}"
+IMAGE="quilter-api"
+NAMESPACE="quilter-demo"
+TF_DIR="$(cd "$(dirname "$0")/terraform" && pwd)"
+KUBECONFIG_PATH="${KUBECONFIG:-$HOME/.kube/config}"
+export KUBECONFIG="$KUBECONFIG_PATH"
+WORKER_SSH_USER="${WORKER_SSH_USER:-core}"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+info()  { echo -e "${BLUE}[info]${NC}  $*"; }
+ok()    { echo -e "${GREEN}[ok]${NC}    $*"; }
+warn()  { echo -e "${YELLOW}[warn]${NC}  $*"; }
+err()   { echo -e "${RED}[err]${NC}   $*" >&2; }
+
+require() {
+    if ! command -v "$1" &>/dev/null; then
+        err "$1 is not installed"
+        return 1
+    fi
+    ok "$1 found: $(command -v "$1")"
+}
+
+ensure_kubeconfig() {
+    if [[ -r "$KUBECONFIG_PATH" ]]; then
+        return 0
+    fi
+
+    if [[ -f /etc/rancher/k3s/k3s.yaml ]]; then
+        info "Copying k3s kubeconfig to $KUBECONFIG_PATH"
+        mkdir -p "$(dirname "$KUBECONFIG_PATH")"
+        sudo cp /etc/rancher/k3s/k3s.yaml "$KUBECONFIG_PATH"
+        sudo chown "$(id -u):$(id -g)" "$KUBECONFIG_PATH"
+        ok "kubeconfig ready"
+    else
+        err "No kubeconfig found at $KUBECONFIG_PATH"
+        return 1
+    fi
+}
+
+cmd_preflight() {
+    info "Checking prerequisites..."
+    local failed=0
+    require docker   || failed=1
+    require terraform || failed=1
+    require kubectl  || failed=1
+    ensure_kubeconfig || failed=1
+    if [[ $failed -eq 1 ]]; then
+        err "Preflight checks failed"
+        return 1
+    fi
+    ok "All prerequisites met"
+}
+
+cmd_build() {
+    info "Building ${IMAGE}:${VERSION}"
+    docker build -t "${IMAGE}:${VERSION}" "$(dirname "$0")"
+    ok "Image built: ${IMAGE}:${VERSION}"
+
+    info "Saving image to tarball..."
+    local tarball="/tmp/${IMAGE}-${VERSION}.tar"
+    docker save "${IMAGE}:${VERSION}" -o "$tarball"
+
+    info "Loading image into k3s containerd (all nodes)..."
+    # Load on control plane
+    sudo k3s ctr images import "$tarball"
+    ok "Image loaded on control plane"
+
+    # Load on worker nodes (skip if single-node cluster)
+    local workers
+    workers=$(kubectl get nodes -o json 2>/dev/null | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for node in data['items']:
+    labels = node['metadata'].get('labels', {})
+    if 'node-role.kubernetes.io/control-plane' not in labels:
+        for addr in node['status']['addresses']:
+            if addr['type'] == 'InternalIP':
+                print(addr['address'])
+" 2>/dev/null || true)
+
+    for ip in $workers; do
+        if [[ -n "$ip" ]]; then
+            info "Loading image on worker $ip..."
+            scp -q -o StrictHostKeyChecking=no "$tarball" "${WORKER_SSH_USER}@${ip}:/tmp/" \
+                && ssh -o StrictHostKeyChecking=no "${WORKER_SSH_USER}@${ip}" "sudo k3s ctr images import /tmp/$(basename "$tarball") && rm /tmp/$(basename "$tarball")" \
+                && ok "Image loaded on $ip" \
+                || warn "Failed to load image on $ip (may not be reachable)"
+        fi
+    done
+
+    rm -f "$tarball"
+    ok "Image distributed to cluster"
+}
+
+cmd_deploy() {
+    ensure_kubeconfig
+    info "Deploying version ${VERSION}"
+
+    terraform -chdir="$TF_DIR" init -input=false
+    terraform -chdir="$TF_DIR" apply -auto-approve \
+        -var="app_version=${VERSION}" \
+        -var="kubeconfig=${KUBECONFIG_PATH}"
+
+    info "Waiting for rollout..."
+    kubectl -n "$NAMESPACE" rollout status deployment/quilter-api --timeout=60s
+    ok "Deployed version ${VERSION}"
+}
+
+cmd_up() {
+    cmd_preflight
+    cmd_build
+    cmd_deploy
+}
+
+cmd_down() {
+    ensure_kubeconfig
+    info "Destroying resources..."
+    terraform -chdir="$TF_DIR" destroy -auto-approve \
+        -var="app_version=${VERSION}" \
+        -var="kubeconfig=${KUBECONFIG_PATH}" || true
+    ok "Resources destroyed"
+}
+
+cmd_status() {
+    ensure_kubeconfig
+    info "Cluster nodes:"
+    kubectl get nodes -o wide
+    echo
+    info "Pods in ${NAMESPACE}:"
+    kubectl -n "$NAMESPACE" get pods -o wide 2>/dev/null || warn "Namespace ${NAMESPACE} not found"
+    echo
+    info "Services in ${NAMESPACE}:"
+    kubectl -n "$NAMESPACE" get svc 2>/dev/null || true
+    echo
+    info "Deployed version:"
+    kubectl -n "$NAMESPACE" get deployment quilter-api -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="APP_VERSION")].value}' 2>/dev/null && echo || warn "Deployment not found"
+}
+
+cmd_logs() {
+    ensure_kubeconfig
+    local pod
+    pod=$(kubectl -n "$NAMESPACE" get pods -l app.kubernetes.io/name=quilter-api -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    if [[ -z "$pod" ]]; then
+        err "No pods found"
+        return 1
+    fi
+    info "Tailing logs for ${pod}..."
+    kubectl -n "$NAMESPACE" logs -f "$pod"
+}
+
+cmd_url() {
+    ensure_kubeconfig
+    info "Forwarding quilter-api service to localhost:8080..."
+    info "Endpoints:"
+    ok "  Health: http://localhost:8080/healthz"
+    ok "  Version: http://localhost:8080/version"
+    echo
+    info "Press Ctrl+C to stop"
+    kubectl -n "$NAMESPACE" port-forward svc/quilter-api 8080:80
+}
+
+cmd_test() {
+    info "Running smoke tests..."
+    local failed=0
+
+    info "Testing /healthz"
+    local health
+    health=$(curl -sf http://localhost:8080/healthz 2>/dev/null) || { err "/healthz failed"; failed=1; }
+    if [[ $failed -eq 0 ]]; then
+        echo "  $health"
+        ok "/healthz passed"
+    fi
+
+    info "Testing /version"
+    local ver
+    ver=$(curl -sf http://localhost:8080/version 2>/dev/null) || { err "/version failed"; failed=1; }
+    if [[ $failed -eq 0 ]]; then
+        echo "  $ver"
+        ok "/version passed"
+    fi
+
+    if [[ $failed -eq 1 ]]; then
+        err "Smoke tests failed. Is port-forward running? (./dev url)"
+        return 1
+    fi
+    ok "All smoke tests passed"
+}
+
+usage() {
+    cat <<EOF
+Usage: ./dev <command> [options]
+
+Commands:
+  up          Full lifecycle: preflight → build → deploy
+  down        Tear down all resources
+  build       Build Docker image and load into k3s
+  deploy      Run terraform apply
+  status      Show cluster and deployment status
+  logs        Tail pod logs
+  url         Port-forward service to localhost:8080
+  test        Smoke test endpoints via curl
+  preflight   Check prerequisites
+
+Environment:
+  VERSION     App version to deploy (default: latest)
+
+Examples:
+  VERSION=1.0.0 ./dev up      # Build and deploy v1.0.0
+  ./dev url &                  # Port-forward in background
+  ./dev test                   # Run smoke tests
+  VERSION=2.0.0 ./dev up      # Rolling update to v2.0.0
+  ./dev down                   # Clean teardown
+EOF
+}
+
+case "${1:-}" in
+    up)         cmd_up ;;
+    down)       cmd_down ;;
+    build)      cmd_build ;;
+    deploy)     cmd_deploy ;;
+    status)     cmd_status ;;
+    logs)       cmd_logs ;;
+    url)        cmd_url ;;
+    test)       cmd_test ;;
+    preflight)  cmd_preflight ;;
+    -h|--help|help|"")  usage ;;
+    *)
+        err "Unknown command: $1"
+        usage
+        exit 1
+        ;;
+esac
