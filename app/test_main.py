@@ -13,7 +13,7 @@ def client():
 def test_healthz(client):
     resp = client.get("/healthz")
     assert resp.status_code == 200
-    assert resp.get_json() == {"status": "healthy"}
+    assert resp.get_json() == {"status": "ok"}
 
 
 def test_version_default(client):

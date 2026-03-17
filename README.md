@@ -21,7 +21,7 @@ A containerized Python API deployed to local Kubernetes with Terraform, wrapped 
 ```
 
 **API Endpoints:**
-- `GET /healthz` — Health check (`{"status": "healthy"}`)
+- `GET /healthz` — Health check (`{"status": "ok"}`)
 - `GET /version` — App version (`{"version": "1.0.0"}`)
 
 ## Prerequisites
